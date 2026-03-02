@@ -311,8 +311,8 @@ impl MultiplexMsg {
                 let first = flags & MSG_PORT_DATA_FLAG_FIRST != 0;
                 let last = flags & MSG_PORT_DATA_FLAG_LAST != 0;
                 let wait = flags & MSG_PORT_DATA_FLAG_WAIT != 0;
-                let mut ids = (flags & MSG_PORT_DATA_FLAG_IDS != 0).then_some(Vec::new());
-                let mut ports = Vec::new();
+                let mut ids = (flags & MSG_PORT_DATA_FLAG_IDS != 0).then_some(Vec::with_capacity(16));
+                let mut ports = Vec::with_capacity(16);
                 loop {
                     match reader.read_u32::<LE>() {
                         Ok(p) => ports.push(p),
@@ -340,7 +340,7 @@ impl MultiplexMsg {
     }
 
     pub(crate) fn to_vec(&self) -> Vec<u8> {
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(MAX_MSG_LENGTH);
         self.write(&mut data).expect("message serialization failed");
         data
     }

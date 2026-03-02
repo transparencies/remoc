@@ -23,6 +23,7 @@ use tokio::{
     sync::{mpsc, mpsc::Permit, oneshot},
     try_join,
 };
+use tokio_util::sync::ReusableBoxFuture;
 
 use super::{
     AnyStorage, Cfg, ChMuxError, PROTOCOL_VERSION, PROTOCOL_VERSION_PORT_ID, PortReq,
@@ -535,7 +536,7 @@ where
             }
         }
 
-        let mut next_ping = get_next_ping(ping_interval).fuse().boxed();
+        let mut next_ping = ReusableBoxFuture::new(get_next_ping(ping_interval));
         let mut need_flush = false;
 
         loop {
@@ -555,7 +556,7 @@ where
                                 break;
                             }
 
-                            next_ping = get_next_ping(ping_interval).fuse().boxed();
+                            next_ping.set(get_next_ping(ping_interval));
                             need_flush = true;
                         }
                         None => break,
@@ -564,7 +565,7 @@ where
 
                 () = &mut next_ping => {
                     Self::feed_msg(TransportMsg::new(MultiplexMsg::Ping), sink).await?;
-                    next_ping = get_next_ping(ping_interval).fuse().boxed();
+                    next_ping.set(get_next_ping(ping_interval));
                     need_flush = true;
                 }
 
@@ -595,7 +596,8 @@ where
             }
         }
 
-        let mut next_timeout = get_connection_timeout(connection_timeout).fuse().boxed();
+        let mut next_timeout = ReusableBoxFuture::new(get_connection_timeout(connection_timeout));
+
         while let Ok(tx_permit) = tx.reserve().await {
             tokio::select! {
                 biased;
@@ -608,7 +610,7 @@ where
                         break;
                     }
 
-                    next_timeout = get_connection_timeout(connection_timeout).fuse().boxed();
+                    next_timeout.set(get_connection_timeout(connection_timeout));
                 },
 
                 () = &mut next_timeout => return Err(ChMuxError::Timeout),
