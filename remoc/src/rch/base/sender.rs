@@ -456,7 +456,7 @@ where
         // chmux connect requests.
         //
         // We have to spawn a task for this to ensure cancellation safety.
-        for (callback, connect) in callbacks.into_iter().zip(connects.into_iter()) {
+        for (callback, connect) in callbacks.into_iter().zip(connects) {
             exec::spawn(callback(connect).in_current_span());
         }
 
