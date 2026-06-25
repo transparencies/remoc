@@ -529,7 +529,8 @@ impl TraitDef {
             #[serde(crate = "::remoc::_serde")]
             #[serde(bound(serialize = #impl_generics_where_str))]
             #[serde(bound(deserialize = #impl_generics_where_str))]
-            enum #req_value #ty_generics #ty_generics_where {
+            #[doc(hidden)]
+            pub enum #req_value #ty_generics #ty_generics_where {
                 #value_entries
                 #[serde(skip)]
                 __Phantom (::std::marker::PhantomData<(#ty_generics_list)>)
@@ -554,7 +555,8 @@ impl TraitDef {
             #[serde(crate = "::remoc::_serde")]
             #[serde(bound(serialize = #impl_generics_where_str))]
             #[serde(bound(deserialize = #impl_generics_where_str))]
-            enum #req_ref #ty_generics #ty_generics_where {
+            #[doc(hidden)]
+            pub enum #req_ref #ty_generics #ty_generics_where {
                 #ref_entries
                 #[serde(skip)]
                 __Phantom (::std::marker::PhantomData<(#ty_generics_list)>)
@@ -579,7 +581,8 @@ impl TraitDef {
             #[serde(crate = "::remoc::_serde")]
             #[serde(bound(serialize = #impl_generics_where_str))]
             #[serde(bound(deserialize = #impl_generics_where_str))]
-            enum #req_ref_mut #ty_generics #ty_generics_where {
+            #[doc(hidden)]
+            pub enum #req_ref_mut #ty_generics #ty_generics_where {
                 #ref_mut_entries
                 #[serde(skip)]
                 __Phantom (::std::marker::PhantomData<(#ty_generics_list)>)
@@ -718,27 +721,36 @@ impl TraitDef {
             quote! {}
         };
 
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
+
         quote! {
             #[doc=#doc]
             #vis struct #server #ty_generics #ty_generics_where {
                 target: Target,
                 req_rx: ::remoc::rch::mpsc::Receiver<
-                    ::remoc::rtc::Req<
-                        #req_value #req_generics,
-                        #req_ref #req_generics,
-                        #req_ref_mut #req_generics,
-                    >,
+                    ::remoc::rtc::Req<#req_params>,
                     Codec,
                 >,
-                on_req_receive_error: ::remoc::rtc::OnReqReceiveError,
+                monitor: ::std::boxed::Box<dyn ::remoc::rtc::ServerMonitor<#req_params>>,
             }
 
             impl #impl_generics_impl ::remoc::rtc::ServerBase for #server #impl_generics_ty #impl_generics_where
             {
                 type Client = #client #req_generics;
+            }
 
-                fn set_on_req_receive_error(&mut self, on_req_receive_error: ::remoc::rtc::OnReqReceiveError) {
-                    self.on_req_receive_error = on_req_receive_error;
+            impl #impl_generics_impl ::remoc::rtc::MonitorableServer for #server #impl_generics_ty #impl_generics_where
+            {
+                type Value = #req_value #req_generics;
+                type Ref = #req_ref #req_generics;
+                type RefMut = #req_ref_mut #req_generics;
+
+                fn set_monitor(&mut self, monitor: impl ::remoc::rtc::ServerMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static) {
+                    self.monitor = ::std::boxed::Box::new(monitor);
                 }
             }
 
@@ -747,13 +759,17 @@ impl TraitDef {
                 fn new(target: Target, request_buffer: usize) -> (Self, Self::Client) {
                     let (req_tx, req_rx) = ::remoc::rch::mpsc::channel(request_buffer);
                     (
-                        Self { target, req_rx, on_req_receive_error: ::remoc::rtc::OnReqReceiveError::default() },
+                        Self {
+                            target,
+                            req_rx,
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                        },
                         Self::Client::new(req_tx),
                     )
                 }
 
                 async fn serve(self) -> (::std::option::Option<Target>, ::std::result::Result<(), ::remoc::rtc::ServeError>) {
-                    let Self { mut target, mut req_rx, on_req_receive_error } = self;
+                    let Self { mut target, mut req_rx, mut monitor } = self;
                     let (err_tx, mut err_rx) = ::remoc::rtc::reply_error_channel();
 
                     let target_opt = loop {
@@ -761,6 +777,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return (Some(target), Err(err.into())),
                             req = req_rx.recv() => {
+                                ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req, target);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Value(req))) => {
                                         #dispatch_value
@@ -774,11 +791,7 @@ impl TraitDef {
                                     },
                                     Ok(None) => break Some(target),
                                     Err(err) if err.is_final() => break Some(target),
-                                    Err(err) => {
-                                        if let Err(err) = on_req_receive_error.handle(err).await {
-                                            return (Some(target), Err(err));
-                                        }
-                                    },
+                                    Err(err) => return (Some(target), Err(err.into())),
                                 }
                             }
                         }
@@ -828,27 +841,36 @@ impl TraitDef {
             quote! {}
         };
 
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
+
         quote! {
             #[doc=#doc]
             #vis struct #server #ty_generics #ty_generics_where {
                 target: &'target Target,
                 req_rx: ::remoc::rch::mpsc::Receiver<
-                    ::remoc::rtc::Req<
-                        #req_value #req_generics,
-                        #req_ref #req_generics,
-                        #req_ref_mut #req_generics,
-                    >,
+                    ::remoc::rtc::Req<#req_params>,
                     Codec,
                 >,
-                on_req_receive_error: ::remoc::rtc::OnReqReceiveError,
+                monitor: ::std::boxed::Box<dyn ::remoc::rtc::ServerMonitor<#req_params>>,
             }
 
             impl #impl_generics_impl ::remoc::rtc::ServerBase for #server #impl_generics_ty #impl_generics_where
             {
                 type Client = #client #req_generics;
+            }
 
-                fn set_on_req_receive_error(&mut self, on_req_receive_error: ::remoc::rtc::OnReqReceiveError) {
-                    self.on_req_receive_error = on_req_receive_error;
+            impl #impl_generics_impl ::remoc::rtc::MonitorableServer for #server #impl_generics_ty #impl_generics_where
+            {
+                type Value = #req_value #req_generics;
+                type Ref = #req_ref #req_generics;
+                type RefMut = #req_ref_mut #req_generics;
+
+                fn set_monitor(&mut self, monitor: impl ::remoc::rtc::ServerMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static) {
+                    self.monitor = ::std::boxed::Box::new(monitor);
                 }
             }
 
@@ -857,13 +879,17 @@ impl TraitDef {
                 fn new(target: &'target Target, request_buffer: usize) -> (Self, Self::Client) {
                     let (req_tx, req_rx) = ::remoc::rch::mpsc::channel(request_buffer);
                     (
-                        Self { target, req_rx, on_req_receive_error: ::remoc::rtc::OnReqReceiveError::default() },
+                        Self {
+                            target,
+                            req_rx,
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                        },
                         Self::Client::new(req_tx),
                     )
                 }
 
                 async fn serve(self) -> ::std::result::Result<(), ::remoc::rtc::ServeError> {
-                    let Self { target, mut req_rx, on_req_receive_error } = self;
+                    let Self { target, mut req_rx, mut monitor } = self;
                     let (err_tx, mut err_rx) = ::remoc::rtc::reply_error_channel();
 
                     let ret = loop {
@@ -871,6 +897,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return Err(err.into()),
                             req = req_rx.recv() => {
+                                ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Ref(req))) => {
                                         #dispatch_ref
@@ -878,7 +905,7 @@ impl TraitDef {
                                     Ok(Some(_)) => (),
                                     Ok(None) => break,
                                     Err(err) if err.is_final() => break,
-                                    Err(err) => on_req_receive_error.handle(err).await?,
+                                    Err(err) => return Err(err.into()),
                                 }
                             }
                         }
@@ -933,27 +960,36 @@ impl TraitDef {
             quote! {}
         };
 
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
+
         quote! {
             #[doc=#doc]
             #vis struct #server #ty_generics #ty_generics_where {
                 target: &'target mut Target,
                 req_rx: ::remoc::rch::mpsc::Receiver<
-                    ::remoc::rtc::Req<
-                        #req_value #req_generics,
-                        #req_ref #req_generics,
-                        #req_ref_mut #req_generics,
-                    >,
+                    ::remoc::rtc::Req<#req_params>,
                     Codec,
                 >,
-                on_req_receive_error: ::remoc::rtc::OnReqReceiveError,
+                monitor: ::std::boxed::Box<dyn ::remoc::rtc::ServerMonitor<#req_params>>,
             }
 
             impl #impl_generics_impl ::remoc::rtc::ServerBase for #server #impl_generics_ty #impl_generics_where
             {
                 type Client = #client #req_generics;
+            }
 
-                fn set_on_req_receive_error(&mut self, on_req_receive_error: ::remoc::rtc::OnReqReceiveError) {
-                    self.on_req_receive_error = on_req_receive_error;
+            impl #impl_generics_impl ::remoc::rtc::MonitorableServer for #server #impl_generics_ty #impl_generics_where
+            {
+                type Value = #req_value #req_generics;
+                type Ref = #req_ref #req_generics;
+                type RefMut = #req_ref_mut #req_generics;
+
+                fn set_monitor(&mut self, monitor: impl ::remoc::rtc::ServerMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static) {
+                    self.monitor = ::std::boxed::Box::new(monitor);
                 }
             }
 
@@ -962,13 +998,17 @@ impl TraitDef {
                 fn new(target: &'target mut Target, request_buffer: usize) -> (Self, Self::Client) {
                     let (req_tx, req_rx) = ::remoc::rch::mpsc::channel(request_buffer);
                     (
-                        Self { target, req_rx, on_req_receive_error: ::remoc::rtc::OnReqReceiveError::default()  },
+                        Self {
+                            target,
+                            req_rx,
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                        },
                         Self::Client::new(req_tx),
                     )
                 }
 
                 async fn serve(self) -> ::std::result::Result<(), ::remoc::rtc::ServeError> {
-                    let Self { target, mut req_rx, on_req_receive_error } = self;
+                    let Self { target, mut req_rx, mut monitor } = self;
                     let (err_tx, mut err_rx) = ::remoc::rtc::reply_error_channel();
 
                     let ret = loop {
@@ -976,6 +1016,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return Err(err.into()),
                             req = req_rx.recv() => {
+                                ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Ref(req))) => {
                                         #dispatch_ref
@@ -986,7 +1027,7 @@ impl TraitDef {
                                     Ok(Some(_)) => (),
                                     Ok(None) => break,
                                     Err(err) if err.is_final() => break,
-                                    Err(err) => on_req_receive_error.handle(err).await?,
+                                    Err(err) => return Err(err.into()),
                                 }
                             }
                         }
@@ -1032,27 +1073,36 @@ impl TraitDef {
             quote! {}
         };
 
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
+
         quote! {
             #[doc=#doc]
             #vis struct #server #ty_generics #ty_generics_where {
                 target: ::std::sync::Arc<Target>,
                 req_rx: ::remoc::rch::mpsc::Receiver<
-                    ::remoc::rtc::Req<
-                        #req_value #req_generics,
-                        #req_ref #req_generics,
-                        #req_ref_mut #req_generics,
-                    >,
+                    ::remoc::rtc::Req<#req_params>,
                     Codec,
                 >,
-                on_req_receive_error: ::remoc::rtc::OnReqReceiveError,
+                monitor: ::std::boxed::Box<dyn ::remoc::rtc::ServerMonitor<#req_params>>,
             }
 
             impl #impl_generics_impl ::remoc::rtc::ServerBase for #server #impl_generics_ty #impl_generics_where
             {
                 type Client = #client #req_generics;
+            }
 
-                fn set_on_req_receive_error(&mut self, on_req_receive_error: ::remoc::rtc::OnReqReceiveError) {
-                    self.on_req_receive_error = on_req_receive_error;
+            impl #impl_generics_impl ::remoc::rtc::MonitorableServer for #server #impl_generics_ty #impl_generics_where
+            {
+                type Value = #req_value #req_generics;
+                type Ref = #req_ref #req_generics;
+                type RefMut = #req_ref_mut #req_generics;
+
+                fn set_monitor(&mut self, monitor: impl ::remoc::rtc::ServerMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static) {
+                    self.monitor = ::std::boxed::Box::new(monitor);
                 }
             }
 
@@ -1061,13 +1111,17 @@ impl TraitDef {
                 fn new(target: ::std::sync::Arc<Target>, request_buffer: usize) -> (Self, Self::Client) {
                     let (req_tx, req_rx) = ::remoc::rch::mpsc::channel(request_buffer);
                     (
-                        Self { target, req_rx, on_req_receive_error: ::remoc::rtc::OnReqReceiveError::default() },
+                        Self {
+                            target,
+                            req_rx,
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                        },
                         Self::Client::new(req_tx),
                     )
                 }
 
                 async fn serve(self, spawn: bool) -> ::std::result::Result<(), ::remoc::rtc::ServeError> {
-                    let Self { target, mut req_rx, on_req_receive_error } = self;
+                    let Self { target, mut req_rx, mut monitor } = self;
                     let (err_tx, mut err_rx) = ::remoc::rtc::reply_error_channel();
 
                     let ret = loop {
@@ -1075,6 +1129,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return Err(err.into()),
                             req = req_rx.recv() => {
+                                ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Ref(req))) => {
                                         let err_tx = err_tx.clone();
@@ -1091,7 +1146,7 @@ impl TraitDef {
                                     Ok(Some(_)) => (),
                                     Ok(None) => break,
                                     Err(err) if err.is_final() => break,
-                                    Err(err) => on_req_receive_error.handle(err).await?,
+                                    Err(err) => return Err(err.into()),
                                 }
                             }
                         }
@@ -1143,27 +1198,36 @@ impl TraitDef {
             quote! {}
         };
 
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
+
         quote! {
             #[doc=#doc]
             #vis struct #server #ty_generics #ty_generics_where {
                 target: ::std::sync::Arc<::remoc::rtc::LocalRwLock<Target>>,
                 req_rx: ::remoc::rch::mpsc::Receiver<
-                    ::remoc::rtc::Req<
-                        #req_value #req_generics,
-                        #req_ref #req_generics,
-                        #req_ref_mut #req_generics,
-                    >,
+                    ::remoc::rtc::Req<#req_params>,
                     Codec,
                 >,
-                on_req_receive_error: ::remoc::rtc::OnReqReceiveError,
+                monitor: ::std::boxed::Box<dyn ::remoc::rtc::ServerMonitor<#req_params>>,
             }
 
             impl #impl_generics_impl ::remoc::rtc::ServerBase for #server #impl_generics_ty #impl_generics_where
             {
                 type Client = #client #req_generics;
+            }
 
-                fn set_on_req_receive_error(&mut self, on_req_receive_error: ::remoc::rtc::OnReqReceiveError) {
-                    self.on_req_receive_error = on_req_receive_error;
+            impl #impl_generics_impl ::remoc::rtc::MonitorableServer for #server #impl_generics_ty #impl_generics_where
+            {
+                type Value = #req_value #req_generics;
+                type Ref = #req_ref #req_generics;
+                type RefMut = #req_ref_mut #req_generics;
+
+                fn set_monitor(&mut self, monitor: impl ::remoc::rtc::ServerMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static) {
+                    self.monitor = ::std::boxed::Box::new(monitor);
                 }
             }
 
@@ -1172,13 +1236,17 @@ impl TraitDef {
                 fn new(target: ::std::sync::Arc<::remoc::rtc::LocalRwLock<Target>>, request_buffer: usize) -> (Self, Self::Client) {
                     let (req_tx, req_rx) = ::remoc::rch::mpsc::channel(request_buffer);
                     (
-                        Self { target, req_rx, on_req_receive_error: ::remoc::rtc::OnReqReceiveError::default() },
+                        Self {
+                            target,
+                            req_rx,
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                        },
                         Self::Client::new(req_tx),
                     )
                 }
 
                 async fn serve(self, spawn: bool) -> ::std::result::Result<(), ::remoc::rtc::ServeError> {
-                    let Self { target, mut req_rx, on_req_receive_error } = self;
+                    let Self { target, mut req_rx, mut monitor } = self;
                     let (err_tx, mut err_rx) = ::remoc::rtc::reply_error_channel();
 
                     let ret = loop {
@@ -1186,6 +1254,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return Err(err.into()),
                             req = req_rx.recv() => {
+                                ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Ref(req))) => {
                                         let err_tx = err_tx.clone();
@@ -1207,7 +1276,7 @@ impl TraitDef {
                                     Ok(Some(_)) => (),
                                     Ok(None) => break,
                                     Err(err) if err.is_final() => break,
-                                    Err(err) => on_req_receive_error.handle(err).await?,
+                                    Err(err) => return Err(err.into()),
                                 }
                             }
                         }
@@ -1263,12 +1332,6 @@ impl TraitDef {
             impl #impl_generics_impl ::remoc::rtc::ServerBase for #server #impl_generics_ty #impl_generics_where
             {
                 type Client = #client #req_generics;
-
-                /// This method does nothing on a [request receiver](::remoc::rtc::ReqReceiver) since
-                /// all errors are reported directly by the [recv](Self::recv) method.
-                fn set_on_req_receive_error(&mut self, _on_req_receive_error: ::remoc::rtc::OnReqReceiveError) {
-                    // ignored since all errors are reported directly
-                }
             }
 
             impl #impl_generics_impl ::remoc::rtc::ReqReceiver <Codec> for #server #impl_generics_ty #impl_generics_where

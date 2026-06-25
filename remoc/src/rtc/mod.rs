@@ -233,6 +233,7 @@
 //! ```
 //!
 
+use futures::future::BoxFuture;
 use std::{
     error::Error,
     fmt,
@@ -389,14 +390,13 @@ impl From<oneshot::RecvError> for CallError {
 }
 
 /// A request from client to server.
-#[doc(hidden)]
 #[derive(Serialize, Deserialize)]
 pub enum Req<V, R, M> {
-    /// Request by value (self).
+    /// Request by value (`self`).
     Value(V),
-    /// Request by reference (&self).
+    /// Request by reference (`&self`).
     Ref(R),
-    /// Request by mutable reference (&mut self).
+    /// Request by mutable reference (`&mut self`).
     RefMut(M),
 }
 
@@ -466,12 +466,6 @@ impl Future for Closed {
 pub trait ServerBase {
     /// The client type, which can be sent to a remote endpoint.
     type Client: Client;
-
-    /// Determines what should happen on the server-side if receiving an RTC
-    /// request fails.
-    ///
-    /// The default is to ignore the receive error.
-    fn set_on_req_receive_error(&mut self, on_req_receive_error: OnReqReceiveError);
 }
 
 /// A server of a remotable trait taking the target object by value.
@@ -578,36 +572,77 @@ where
     fn close(&mut self);
 }
 
-/// Determines what should happen on the server-side if receiving an RTC
-/// request fails.
-///
-/// Client-side behavior is unaffected by this choice, and will always
-/// result in a [`CallError`] if the RTC request fails for any reason.
-#[derive(Debug, Default, Clone)]
-pub enum OnReqReceiveError {
-    /// Ignore the failure to receive the request and write a log message.
-    #[default]
-    Ignore,
-    /// Send the receive error over the local MPSC channel.
-    Send(tokio::sync::mpsc::Sender<mpsc::RecvError>),
-    /// Fail the server, returning the receive error.
-    Fail,
+/// Allows setting the [server request monitor](ServerMonitor) on a server.
+pub trait MonitorableServer {
+    /// Type of request by value (`self`).
+    type Value;
+    /// Type of request by reference (`&self`).
+    type Ref;
+    /// Type of request by mutable reference (`&mut self`).
+    type RefMut;
+    /// Sets the [server request monitor](ServerMonitor).
+    fn set_monitor(&mut self, monitor: impl ServerMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static);
 }
 
-impl OnReqReceiveError {
-    #[doc(hidden)]
-    pub async fn handle(&self, err: mpsc::RecvError) -> Result<(), ServeError> {
-        match self {
-            Self::Ignore => {
-                tracing::warn!(%err, "receiving RTC request failed");
-                Ok(())
-            }
-            Self::Send(tx) => {
-                let _ = tx.send(err).await;
-                Ok(())
-            }
-            Self::Fail => Err(ServeError::ReqReceive(err)),
+/// Server request monitor.
+///
+/// Allows monitoring each request a server handles.
+pub trait ServerMonitor<V, R, M>: Send {
+    /// Called for each request before dispatch.
+    ///
+    /// The function can inspect the request and decide whether it should be
+    /// handled, dropped or the server should fail with a custom error.
+    fn pre_dispatch<'a>(
+        &mut self, req: &'a Result<Option<Req<V, R, M>>, mpsc::RecvError>,
+    ) -> BoxFuture<'a, DispatchDecision>;
+}
+
+/// Decision on how a request should be processed made by [`ServerMonitor::pre_dispatch`].
+#[derive(Debug)]
+pub enum DispatchDecision {
+    /// Handle the request.
+    Handle,
+    /// Drop the request.
+    Drop,
+    /// Fail the server returning [`ServeError::Monitor`].
+    Error(Box<dyn Error + Send>),
+}
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! server_monitor_pre_dispatch {
+    ($monitor:expr, $req:expr) => {
+        match $monitor.pre_dispatch(&$req).await {
+            ::remoc::rtc::DispatchDecision::Handle => (),
+            ::remoc::rtc::DispatchDecision::Drop => continue,
+            ::remoc::rtc::DispatchDecision::Error(err) => return Err(::remoc::rtc::ServeError::Monitor(err)),
         }
+    };
+    ($monitor:expr, $req:expr, $target:expr) => {
+        match $monitor.pre_dispatch(&$req).await {
+            ::remoc::rtc::DispatchDecision::Handle => (),
+            ::remoc::rtc::DispatchDecision::Drop => continue,
+            ::remoc::rtc::DispatchDecision::Error(err) => {
+                return (Some($target), Err(::remoc::rtc::ServeError::Monitor(err)))
+            }
+        }
+    };
+}
+#[doc(hidden)]
+pub use crate::server_monitor_pre_dispatch;
+
+/// The default [server request monitor](ServerMonitor).
+///
+/// It handles all requests.
+#[derive(Debug, Default)]
+pub struct DefaultServerMonitor;
+
+impl<V, R, M> ServerMonitor<V, R, M> for DefaultServerMonitor {
+    fn pre_dispatch<'a>(
+        &mut self, req: &'a Result<Option<Req<V, R, M>>, mpsc::RecvError>,
+    ) -> BoxFuture<'a, DispatchDecision> {
+        let _ = req;
+        std::future::ready(DispatchDecision::Handle).boxed()
     }
 }
 
@@ -618,6 +653,8 @@ pub enum ServeError {
     ReqReceive(mpsc::RecvError),
     /// Sending a reply to the client failed,
     ReplySend(SendingErrorKind),
+    /// Server failed because [server request monitor](ServerMonitor) returned [`DispatchDecision::Error`].
+    Monitor(Box<dyn Error + Send>),
 }
 
 impl From<mpsc::RecvError> for ServeError {
@@ -643,6 +680,7 @@ impl fmt::Display for ServeError {
         match self {
             Self::ReqReceive(err) => write!(f, "failed to receive RTC request: {err}"),
             Self::ReplySend(err) => write!(f, "failed to send reply to RTC request: {err}"),
+            Self::Monitor(err) => write!(f, "failed by server monitor: {err}"),
         }
     }
 }
