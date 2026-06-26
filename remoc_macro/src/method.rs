@@ -349,14 +349,14 @@ impl TraitMethod {
                     biased;
                     () = __reply_tx.closed() => (),
                     result = __target.#ident(#args) => {
-                        ::remoc::rtc::send_reply(__reply_tx, &__err_tx, result).await;
+                        ::remoc::rtc::send_reply(__reply_tx, &__err_tx, __guard, result).await;
                     }
                 }
             }
         } else {
             quote! {
                 let result = __target.#ident(#args).await;
-                ::remoc::rtc::send_reply(__reply_tx, &__err_tx, result).await;
+                ::remoc::rtc::send_reply(__reply_tx, &__err_tx, __guard, result).await;
             }
         };
 

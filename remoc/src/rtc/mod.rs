@@ -680,7 +680,11 @@ pub trait ServerMonitor<Value, Ref, RefMut>: Send {
 /// Request dispatch guard.
 ///
 /// It is held until the guarded request is processed and then dropped.
-pub trait DispatchGuard: Send {}
+pub trait DispatchGuard: Send {
+    /// Notifies the request dispatch guard that the called method returned
+    /// an error.
+    fn failed(&mut self) {}
+}
 
 /// Decision on how a request should be processed made by the [server monitor](ServerMonitor).
 pub enum DispatchDecision {
@@ -862,11 +866,18 @@ pub const fn missing_max_reply_size() -> usize {
 
 /// Send reply to request.
 #[doc(hidden)]
-pub async fn send_reply<T, Codec>(reply_tx: oneshot::Sender<T, Codec>, err_tx: &ReplyErrorSender, result: T)
-where
+pub async fn send_reply<T, E, Codec>(
+    reply_tx: oneshot::Sender<Result<T, E>, Codec>, err_tx: &ReplyErrorSender,
+    mut dispatch_guard: Box<dyn DispatchGuard>, result: Result<T, E>,
+) where
     T: RemoteSend,
+    E: RemoteSend,
     Codec: codec::Codec,
 {
+    if result.is_err() {
+        dispatch_guard.failed();
+    }
+
     let Ok(sending) = reply_tx.send(result) else { return };
 
     let err_tx = err_tx.clone();
@@ -881,6 +892,8 @@ where
                 }
                 let _ = err_tx.send(kind).await;
             }
+
+            drop(dispatch_guard);
         }
         .in_current_span(),
     );

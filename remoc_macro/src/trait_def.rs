@@ -535,8 +535,12 @@ impl TraitDef {
             }
 
             impl #impl_generics_impl #req_value #impl_generics_ty #impl_generics_where {
-                fn dispatch<Target>(self, __target: Target, __err_tx: ::remoc::rtc::ReplyErrorSender) ->
-                     ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ()> + ::std::marker::Send>>
+                fn dispatch<Target>(
+                    self,
+                    __target: Target,
+                    __err_tx: ::remoc::rtc::ReplyErrorSender,
+                    mut __guard: ::std::boxed::Box<dyn ::remoc::rtc::DispatchGuard>,
+                ) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ()> + ::std::marker::Send>>
                 where
                     Target: #trait_path_dispatch,
                     Target: ::std::marker::Send + 'static,
@@ -562,8 +566,12 @@ impl TraitDef {
             }
 
             impl #impl_generics_impl #req_ref #impl_generics_ty #impl_generics_where {
-                fn dispatch<'target, Target>(self, __target: &'target Target, __err_tx: ::remoc::rtc::ReplyErrorSender) ->
-                    ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ()> + ::std::marker::Send + 'target>>
+                fn dispatch<'target, Target>(
+                    self,
+                    __target: &'target Target,
+                    __err_tx: ::remoc::rtc::ReplyErrorSender,
+                    mut __guard: ::std::boxed::Box<dyn ::remoc::rtc::DispatchGuard>,
+                ) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ()> + ::std::marker::Send + 'target>>
                 where
                     Target: #trait_path_dispatch,
                     Target: ::std::marker::Sync,
@@ -589,8 +597,12 @@ impl TraitDef {
             }
 
             impl #impl_generics_impl #req_ref_mut #impl_generics_ty #impl_generics_where {
-                fn dispatch<'target, Target>(self, __target: &'target mut Target, __err_tx: ::remoc::rtc::ReplyErrorSender) ->
-                    ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ()> + ::std::marker::Send + 'target>>
+                fn dispatch<'target, Target>(
+                    self,
+                    __target: &'target mut Target,
+                    __err_tx: ::remoc::rtc::ReplyErrorSender,
+                    mut __guard: ::std::boxed::Box<dyn ::remoc::rtc::DispatchGuard>,
+                ) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ()> + ::std::marker::Send + 'target>>
                 where
                     Target: #trait_path_dispatch,
                     Target: ::std::marker::Send,
@@ -640,19 +652,19 @@ impl TraitDef {
         let doc = format!("Server for [{}] taking the target object by value.", &ident);
 
         let dispatch_value = if self.is_taking_value() {
-            quote! { req.dispatch(target, err_tx.clone()).await; }
+            quote! { req.dispatch(target, err_tx.clone(), guard).await; }
         } else {
             quote! {}
         };
 
         let dispatch_ref = if self.is_taking_ref() {
-            quote! { req.dispatch(&target, err_tx.clone()).await; }
+            quote! { req.dispatch(&target, err_tx.clone(), guard).await; }
         } else {
             quote! {}
         };
 
         let dispatch_ref_mut = if self.is_taking_ref_mut() {
-            quote! { req.dispatch(&mut target, err_tx.clone()).await; }
+            quote! { req.dispatch(&mut target, err_tx.clone(), guard).await; }
         } else {
             quote! {}
         };
@@ -704,7 +716,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return (Some(target), Err(err.into())),
                             req = req_rx.recv() => {
-                                let _guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req, target);
+                                let mut guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req, target);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Value(req))) => {
                                         #dispatch_value
@@ -769,7 +781,7 @@ impl TraitDef {
         let doc = format!("Server for [{}] taking the target object by reference.", &ident);
 
         let dispatch_ref = if self.is_taking_ref() {
-            quote! { req.dispatch(target, err_tx.clone()).await; }
+            quote! { req.dispatch(target, err_tx.clone(), guard).await; }
         } else {
             quote! {}
         };
@@ -824,7 +836,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return Err(err.into()),
                             req = req_rx.recv() => {
-                                let _guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
+                                let guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Ref(req))) => {
                                         #dispatch_ref
@@ -882,13 +894,13 @@ impl TraitDef {
         let doc = format!("Server for [{}] taking the target object by mutable reference.", &ident);
 
         let dispatch_ref = if self.is_taking_ref() {
-            quote! { req.dispatch(target, err_tx.clone()).await; }
+            quote! { req.dispatch(target, err_tx.clone(), guard).await; }
         } else {
             quote! {}
         };
 
         let dispatch_ref_mut = if self.is_taking_ref_mut() {
-            quote! { req.dispatch(target, err_tx.clone()).await; }
+            quote! { req.dispatch(target, err_tx.clone(), guard).await; }
         } else {
             quote! {}
         };
@@ -943,7 +955,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return Err(err.into()),
                             req = req_rx.recv() => {
-                                let _guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
+                                let guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Ref(req))) => {
                                         #dispatch_ref
@@ -1001,7 +1013,7 @@ impl TraitDef {
         let doc = format!("Server for [{}] taking the target object by shared reference.", &ident);
 
         let dispatch_ref = if self.is_taking_ref() {
-            quote! { req.dispatch(&*target, err_tx).await; }
+            quote! { req.dispatch(&*target, err_tx, guard).await; }
         } else {
             quote! {}
         };
@@ -1056,7 +1068,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return Err(err.into()),
                             req = req_rx.recv() => {
-                                let _guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
+                                let guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Ref(req))) => {
                                         let err_tx = err_tx.clone();
@@ -1064,7 +1076,6 @@ impl TraitDef {
                                             use ::remoc::rtc::Instrument;
                                             let target = target.clone();
                                             ::remoc::rtc::spawn(async move {
-                                                let _guard = _guard;
                                                 #dispatch_ref
                                             }.in_current_span());
                                         } else {
@@ -1121,13 +1132,13 @@ impl TraitDef {
         let doc = format!("Server for [{}] taking the target object by shared mutable reference.", &ident);
 
         let dispatch_ref = if self.is_taking_ref() {
-            quote! { req.dispatch(&*target, err_tx).await; }
+            quote! { req.dispatch(&*target, err_tx, guard).await; }
         } else {
             quote! {}
         };
 
         let dispatch_ref_mut = if self.is_taking_ref_mut() {
-            quote! { req.dispatch(&mut *target, err_tx.clone()).await; }
+            quote! { req.dispatch(&mut *target, err_tx.clone(), guard).await; }
         } else {
             quote! {}
         };
@@ -1182,7 +1193,7 @@ impl TraitDef {
                             biased;
                             Some(err) = err_rx.recv() => return Err(err.into()),
                             req = req_rx.recv() => {
-                                let _guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
+                                let guard = ::remoc::rtc::server_monitor_pre_dispatch!(monitor, req);
                                 match req {
                                     Ok(Some(::remoc::rtc::Req::Ref(req))) => {
                                         let err_tx = err_tx.clone();
@@ -1190,7 +1201,6 @@ impl TraitDef {
                                             use ::remoc::rtc::Instrument;
                                             let target = target.clone().read_owned().await;
                                             ::remoc::rtc::spawn(async move {
-                                                let _guard = _guard;
                                                 #dispatch_ref
                                             }.in_current_span());
                                         } else {
