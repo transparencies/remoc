@@ -13,7 +13,7 @@ use std::{
 use futures::{FutureExt, future::BoxFuture};
 
 use remoc::rtc::{
-    DispatchDecision, MonitorableServer, Req, ReqGuard, ServeError, Server, ServerMonitor, ServerShared,
+    DispatchDecision, DispatchGuard, MonitorableServer, Req, ServeError, Server, ServerMonitor, ServerShared,
 };
 
 use crate::loop_channel;
@@ -70,7 +70,7 @@ where
             if matches!(req, Ok(Some(_))) {
                 count.fetch_add(1, Ordering::SeqCst);
             }
-            DispatchDecision::Handle
+            DispatchDecision::Pass
         }
         .boxed()
     }
@@ -108,14 +108,8 @@ impl<V, R, M> ServerMonitor<V, R, M> for RateLimitMonitor {
             true
         };
 
-        async move {
-            if allow {
-                DispatchDecision::Handle
-            } else {
-                DispatchDecision::Error(Box::new(RateLimited))
-            }
-        }
-        .boxed()
+        async move { if allow { DispatchDecision::Pass } else { DispatchDecision::Error(Box::new(RateLimited)) } }
+            .boxed()
     }
 }
 
@@ -219,7 +213,7 @@ impl Drop for InFlightGuard {
     }
 }
 
-impl ReqGuard for InFlightGuard {}
+impl DispatchGuard for InFlightGuard {}
 
 /// Monitor that attaches an [`InFlightGuard`] to every handled request.
 struct InFlightMonitor {
@@ -234,7 +228,7 @@ impl<V, R, M> ServerMonitor<V, R, M> for InFlightMonitor {
         let decision = if matches!(req, Ok(Some(_))) {
             DispatchDecision::Guard(Box::new(InFlightGuard::new(self.in_flight.clone(), self.max.clone())))
         } else {
-            DispatchDecision::Handle
+            DispatchDecision::Pass
         };
         async move { decision }.boxed()
     }

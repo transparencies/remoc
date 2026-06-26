@@ -338,6 +338,8 @@ pub enum CallError {
     ///
     /// The server may have been dropped or it may have panicked.
     /// Sending the response may have failed on the server-side.
+    ///
+    /// The request might have been dropped by the client or server monitor.
     Dropped,
     /// Sending to a remote endpoint failed.
     RemoteSend(base::SendErrorKind),
@@ -393,7 +395,7 @@ impl From<oneshot::RecvError> for CallError {
 ///
 /// This groups the methods of a remotable trait by how they take `self`.
 /// Each variant holds a per-kind request enum that in turn has one variant per
-/// method of that kind. 
+/// method of that kind.
 #[derive(Serialize, Deserialize)]
 pub enum Req<Value, Ref, RefMut> {
     /// Request for a method taking self by value (`self`).
@@ -463,6 +465,71 @@ impl Future for Closed {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         self.as_mut().0.poll_unpin(cx)
+    }
+}
+
+/// Allows setting the [client monitor](ClientMonitor) on a [client](Client).
+pub trait MonitorableClient {
+    /// Type of request by value (`self`).
+    type Value;
+    /// Type of request by reference (`&self`).
+    type Ref;
+    /// Type of request by mutable reference (`&mut self`).
+    type RefMut;
+
+    /// Sets the [client monitor](ClientMonitor).
+    fn set_monitor(&mut self, monitor: impl ClientMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static);
+}
+
+/// Allows monitoring each request a client makes.
+pub trait ClientMonitor<Value, Ref, RefMut>: Send + Sync {
+    /// Called for each request before sending it to server.
+    ///
+    /// The function can inspect the request and decide whether it should be
+    /// sent to the server for processing or dropped.
+    fn pre_call<'a>(&self, req: &'a Req<Value, Ref, RefMut>) -> BoxFuture<'a, CallDecision>;
+}
+
+/// Decision on how a request should be processed made by the [client monitor](ClientMonitor).
+pub enum CallDecision {
+    /// Process the request normally.
+    ///
+    /// The request is sent to the server for processing.
+    Pass,
+    /// Guard the request and process it normally.
+    ///
+    /// The request is processed as if [`Pass`](Self::Pass) is specified.
+    /// However, the supplied [`CallGuard`] is held during processing and dropped
+    /// once the request is finished.
+    Guard(Box<dyn CallGuard>),
+    /// Drop the request.
+    ///
+    /// The called client method fails with [`CallError::Dropped`].
+    Drop,
+}
+
+impl fmt::Debug for CallDecision {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Pass => write!(f, "Pass"),
+            Self::Guard(_) => write!(f, "Guard"),
+            Self::Drop => write!(f, "Drop"),
+        }
+    }
+}
+
+/// Request call guard.
+///
+/// It is held until the guarded request is processed and then dropped.
+pub trait CallGuard: Send {
+    /// Notifies the request call guard that the called method returned
+    /// an error.
+    fn failed(&mut self) {}
+
+    /// Notifies the request call guard that receiving the reply from the
+    /// server failed.
+    fn reply_failed(&mut self, err: &oneshot::RecvError) {
+        let _ = err;
     }
 }
 
@@ -574,6 +641,7 @@ where
     /// `self`, and then on the variants of the contained per-kind request enum,
     /// one per method. Reply with the result on the oneshot sender provided in
     /// the `__reply_tx` field of each method variant.
+    #[allow(clippy::type_complexity)]
     fn recv(
         &mut self,
     ) -> impl Future<Output = Result<Option<Req<Self::Value, Self::Ref, Self::RefMut>>, mpsc::RecvError>> + Send;
@@ -593,46 +661,52 @@ pub trait MonitorableServer {
     type Ref;
     /// Type of request by mutable reference (`&mut self`).
     type RefMut;
+
     /// Sets the [server monitor](ServerMonitor).
     fn set_monitor(&mut self, monitor: impl ServerMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static);
 }
 
-/// Server monitor.
-///
 /// Allows monitoring each request a server handles.
-pub trait ServerMonitor<V, R, M>: Send {
-    /// Called for each request before dispatch.
+pub trait ServerMonitor<Value, Ref, RefMut>: Send {
+    /// Called for each request before dispatch to its handling method.
     ///
     /// The function can inspect the request and decide whether it should be
     /// handled, dropped or the server should fail with a custom error.
     fn pre_dispatch<'a>(
-        &mut self, req: &'a Result<Option<Req<V, R, M>>, mpsc::RecvError>,
+        &mut self, req: &'a Result<Option<Req<Value, Ref, RefMut>>, mpsc::RecvError>,
     ) -> BoxFuture<'a, DispatchDecision>;
 }
 
-/// Request guard.
+/// Request dispatch guard.
 ///
-/// It is held until the request is finished and then dropped.
-pub trait ReqGuard: Send {}
+/// It is held until the guarded request is processed and then dropped.
+pub trait DispatchGuard: Send {}
 
-/// Decision on how a request should be processed made by [`ServerMonitor::pre_dispatch`].
+/// Decision on how a request should be processed made by the [server monitor](ServerMonitor).
 pub enum DispatchDecision {
-    /// Handle the request.
-    Handle,
-    /// Guard the request.
+    /// Process the request normally.
     ///
-    /// The supplied [ReqGuard] is dropped once the request is finished.
-    Guard(Box<dyn ReqGuard>),
+    /// In case of the server monitor, the request is dispatched to the corresponding
+    /// function of the remotable trait implementation.
+    Pass,
+    /// Guard the request and process it normally.
+    ///
+    /// The request is processed as if [`Pass`](Self::Pass) is specified.
+    /// However, the supplied [`DispatchGuard`] is held during processing and dropped
+    /// once the request is finished.
+    Guard(Box<dyn DispatchGuard>),
     /// Drop the request.
+    ///
+    /// The client-side method fails with [`CallError::Dropped`].
     Drop,
-    /// Fail the server returning [`ServeError::Monitor`].
+    /// Stop serving and fail returning [`ServeError::Monitor`].
     Error(Box<dyn Error + Send>),
 }
 
 impl fmt::Debug for DispatchDecision {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Handle => write!(f, "Handle"),
+            Self::Pass => write!(f, "Pass"),
             Self::Guard(_) => write!(f, "Guard"),
             Self::Drop => write!(f, "Drop"),
             Self::Error(err) => f.debug_tuple("Error").field(err).finish(),
@@ -645,7 +719,7 @@ impl fmt::Debug for DispatchDecision {
 macro_rules! server_monitor_pre_dispatch {
     ($monitor:expr, $req:expr) => {
         match $monitor.pre_dispatch(&$req).await {
-            ::remoc::rtc::DispatchDecision::Handle => ::std::boxed::Box::new(::remoc::rtc::DefaultReqGuard),
+            ::remoc::rtc::DispatchDecision::Pass => ::std::boxed::Box::new(::remoc::rtc::DefaultGuard),
             ::remoc::rtc::DispatchDecision::Guard(guard) => guard,
             ::remoc::rtc::DispatchDecision::Drop => continue,
             ::remoc::rtc::DispatchDecision::Error(err) => return Err(::remoc::rtc::ServeError::Monitor(err)),
@@ -653,7 +727,7 @@ macro_rules! server_monitor_pre_dispatch {
     };
     ($monitor:expr, $req:expr, $target:expr) => {
         match $monitor.pre_dispatch(&$req).await {
-            ::remoc::rtc::DispatchDecision::Handle => ::std::boxed::Box::new(::remoc::rtc::DefaultReqGuard),
+            ::remoc::rtc::DispatchDecision::Pass => ::std::boxed::Box::new(::remoc::rtc::DefaultGuard),
             ::remoc::rtc::DispatchDecision::Guard(guard) => guard,
             ::remoc::rtc::DispatchDecision::Drop => continue,
             ::remoc::rtc::DispatchDecision::Error(err) => {
@@ -665,30 +739,43 @@ macro_rules! server_monitor_pre_dispatch {
 #[doc(hidden)]
 pub use crate::server_monitor_pre_dispatch;
 
-/// The default [server monitor](ServerMonitor).
+/// The default [client](ClientMonitor) and [server](ServerMonitor).
 ///
-/// It handles all requests.
+/// It passes all requests.
 #[doc(hidden)]
 #[derive(Debug, Default)]
-pub struct DefaultServerMonitor;
+pub struct DefaultMonitor;
 
-impl<V, R, M> ServerMonitor<V, R, M> for DefaultServerMonitor {
-    fn pre_dispatch<'a>(
-        &mut self, req: &'a Result<Option<Req<V, R, M>>, mpsc::RecvError>,
-    ) -> BoxFuture<'a, DispatchDecision> {
+impl<Value, Ref, RefMut> ClientMonitor<Value, Ref, RefMut> for DefaultMonitor {
+    fn pre_call<'a>(&self, req: &'a Req<Value, Ref, RefMut>) -> BoxFuture<'a, CallDecision> {
         let _ = req;
-        std::future::ready(DispatchDecision::Handle).boxed()
+        std::future::ready(CallDecision::Pass).boxed()
     }
 }
 
-/// The default [request guard](ReqGuard).
+impl<Value, Ref, RefMut> ServerMonitor<Value, Ref, RefMut> for DefaultMonitor {
+    fn pre_dispatch<'a>(
+        &mut self, req: &'a Result<Option<Req<Value, Ref, RefMut>>, mpsc::RecvError>,
+    ) -> BoxFuture<'a, DispatchDecision> {
+        let _ = req;
+        std::future::ready(DispatchDecision::Pass).boxed()
+    }
+}
+
+#[doc(hidden)]
+pub fn default_client_monitor<Value, Ref, RefMut>() -> Arc<dyn ClientMonitor<Value, Ref, RefMut>> {
+    Arc::new(DefaultMonitor)
+}
+
+/// The default [call](CallGuard) and [dispatch](DispatchGuard).
 ///
 /// It does nothing.
 #[doc(hidden)]
 #[derive(Debug, Default)]
-pub struct DefaultReqGuard;
+pub struct DefaultGuard;
 
-impl ReqGuard for DefaultReqGuard {}
+impl CallGuard for DefaultGuard {}
+impl DispatchGuard for DefaultGuard {}
 
 /// RTC serving failed.
 #[derive(Debug)]

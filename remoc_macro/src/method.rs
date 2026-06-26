@@ -396,11 +396,30 @@ impl TraitMethod {
             async fn #ident (#self_ref, #args) -> #ret_ty {
                 let (mut reply_tx, reply_rx) = ::remoc::rch::oneshot::channel();
                 reply_tx.set_max_item_size(self.max_reply_size);
+
                 let req_value = #req_enum :: #req_case { __reply_tx: reply_tx, #entries };
                 let req = ::remoc::rtc::Req::#req_type(req_value);
+
+                let mut guard = match self.monitor.pre_call(&req).await {
+                    ::remoc::rtc::CallDecision::Pass => ::std::boxed::Box::new(::remoc::rtc::DefaultGuard),
+                    ::remoc::rtc::CallDecision::Guard(guard) => guard,
+                    ::remoc::rtc::CallDecision::Drop => return Err(::remoc::rtc::CallError::Dropped.into()),
+                };
+
                 self.req_tx.send(req).await.map_err(::remoc::rtc::CallError::from)?;
-                let reply = reply_rx.await.map_err(::remoc::rtc::CallError::from)?;
-                reply
+
+                match reply_rx.await {
+                    Ok(reply) => {
+                        if reply.is_err() {
+                            guard.failed();
+                        }
+                        reply
+                    }
+                    Err(err) => {
+                        guard.reply_failed(&err);
+                        Err(::remoc::rtc::CallError::from(err).into())
+                    }
+                }
             }
         }
     }

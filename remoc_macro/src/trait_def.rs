@@ -626,7 +626,13 @@ impl TraitDef {
         });
         let ty_generics_where = &ty_generics.where_clause;
         let (impl_generics_impl, impl_generics_ty, impl_generics_where) = impl_generics.split_for_impl();
+
         let (req_value, req_ref, req_ref_mut) = self.request_enum_idents();
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
 
         let client = self.client_ident();
         let server = format_ident!("{}Server", &ident);
@@ -651,12 +657,6 @@ impl TraitDef {
             quote! {}
         };
 
-        let req_params = quote! {
-            #req_value #req_generics,
-            #req_ref #req_generics,
-            #req_ref_mut #req_generics,
-        };
-
         quote! {
             #[doc=#doc]
             #vis struct #server #ty_generics #ty_generics_where {
@@ -668,13 +668,11 @@ impl TraitDef {
                 monitor: ::std::boxed::Box<dyn ::remoc::rtc::ServerMonitor<#req_params>>,
             }
 
-            impl #impl_generics_impl ::remoc::rtc::ServerBase for #server #impl_generics_ty #impl_generics_where
-            {
+            impl #impl_generics_impl ::remoc::rtc::ServerBase for #server #impl_generics_ty #impl_generics_where {
                 type Client = #client #req_generics;
             }
 
-            impl #impl_generics_impl ::remoc::rtc::MonitorableServer for #server #impl_generics_ty #impl_generics_where
-            {
+            impl #impl_generics_impl ::remoc::rtc::MonitorableServer for #server #impl_generics_ty #impl_generics_where {
                 type Value = #req_value #req_generics;
                 type Ref = #req_ref #req_generics;
                 type RefMut = #req_ref_mut #req_generics;
@@ -684,15 +682,14 @@ impl TraitDef {
                 }
             }
 
-            impl #impl_generics_impl ::remoc::rtc::Server <Target, Codec> for #server #impl_generics_ty #impl_generics_where
-            {
+            impl #impl_generics_impl ::remoc::rtc::Server <Target, Codec> for #server #impl_generics_ty #impl_generics_where {
                 fn new(target: Target, request_buffer: usize) -> (Self, Self::Client) {
                     let (req_tx, req_rx) = ::remoc::rch::mpsc::channel(request_buffer);
                     (
                         Self {
                             target,
                             req_rx,
-                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultMonitor),
                         },
                         Self::Client::new(req_tx),
                     )
@@ -758,7 +755,13 @@ impl TraitDef {
         });
         let ty_generics_where = &ty_generics.where_clause;
         let (impl_generics_impl, impl_generics_ty, impl_generics_where) = impl_generics.split_for_impl();
+
         let (req_value, req_ref, req_ref_mut) = self.request_enum_idents();
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
 
         let client = self.client_ident();
         let server = format_ident!("{}ServerRef", &ident);
@@ -769,12 +772,6 @@ impl TraitDef {
             quote! { req.dispatch(target, err_tx.clone()).await; }
         } else {
             quote! {}
-        };
-
-        let req_params = quote! {
-            #req_value #req_generics,
-            #req_ref #req_generics,
-            #req_ref_mut #req_generics,
         };
 
         quote! {
@@ -812,7 +809,7 @@ impl TraitDef {
                         Self {
                             target,
                             req_rx,
-                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultMonitor),
                         },
                         Self::Client::new(req_tx),
                     )
@@ -871,7 +868,13 @@ impl TraitDef {
         });
         let ty_generics_where = &ty_generics.where_clause;
         let (impl_generics_impl, impl_generics_ty, impl_generics_where) = impl_generics.split_for_impl();
+
         let (req_value, req_ref, req_ref_mut) = self.request_enum_idents();
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
 
         let client = self.client_ident();
         let server = format_ident!("{}ServerRefMut", &ident);
@@ -888,12 +891,6 @@ impl TraitDef {
             quote! { req.dispatch(target, err_tx.clone()).await; }
         } else {
             quote! {}
-        };
-
-        let req_params = quote! {
-            #req_value #req_generics,
-            #req_ref #req_generics,
-            #req_ref_mut #req_generics,
         };
 
         quote! {
@@ -931,7 +928,7 @@ impl TraitDef {
                         Self {
                             target,
                             req_rx,
-                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultMonitor),
                         },
                         Self::Client::new(req_tx),
                     )
@@ -990,7 +987,13 @@ impl TraitDef {
         });
         let ty_generics_where = &ty_generics.where_clause;
         let (impl_generics_impl, impl_generics_ty, impl_generics_where) = impl_generics.split_for_impl();
+
         let (req_value, req_ref, req_ref_mut) = self.request_enum_idents();
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
 
         let client = self.client_ident();
         let server = format_ident!("{}ServerShared", &ident);
@@ -1001,12 +1004,6 @@ impl TraitDef {
             quote! { req.dispatch(&*target, err_tx).await; }
         } else {
             quote! {}
-        };
-
-        let req_params = quote! {
-            #req_value #req_generics,
-            #req_ref #req_generics,
-            #req_ref_mut #req_generics,
         };
 
         quote! {
@@ -1044,7 +1041,7 @@ impl TraitDef {
                         Self {
                             target,
                             req_rx,
-                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultMonitor),
                         },
                         Self::Client::new(req_tx),
                     )
@@ -1110,7 +1107,13 @@ impl TraitDef {
         });
         let ty_generics_where = &ty_generics.where_clause;
         let (impl_generics_impl, impl_generics_ty, impl_generics_where) = impl_generics.split_for_impl();
+
         let (req_value, req_ref, req_ref_mut) = self.request_enum_idents();
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
 
         let client = self.client_ident();
         let server = format_ident!("{}ServerSharedMut", &ident);
@@ -1127,12 +1130,6 @@ impl TraitDef {
             quote! { req.dispatch(&mut *target, err_tx.clone()).await; }
         } else {
             quote! {}
-        };
-
-        let req_params = quote! {
-            #req_value #req_generics,
-            #req_ref #req_generics,
-            #req_ref_mut #req_generics,
         };
 
         quote! {
@@ -1170,7 +1167,7 @@ impl TraitDef {
                         Self {
                             target,
                             req_rx,
-                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultServerMonitor),
+                            monitor: ::std::boxed::Box::new(::remoc::rtc::DefaultMonitor),
                         },
                         Self::Client::new(req_tx),
                     )
@@ -1395,6 +1392,11 @@ impl TraitDef {
 
         let req_generics = self.req_args_bare(true);
         let (req_value, req_ref, req_ref_mut) = self.request_enum_idents();
+        let req_params = quote! {
+            #req_value #req_generics,
+            #req_ref #req_generics,
+            #req_ref_mut #req_generics,
+        };
 
         let impl_generics_where_pred = &impl_generics_where.unwrap().predicates;
         let impl_generics_where_str = quote! { #impl_generics_where_pred }.to_string();
@@ -1426,6 +1428,7 @@ impl TraitDef {
                             req_tx: self.req_tx.clone(),
                             max_reply_size: self.max_reply_size,
                             drop_tx: self.drop_tx.clone(),
+                            monitor: self.monitor.clone(),
                         }
                     }
                 }
@@ -1457,6 +1460,9 @@ impl TraitDef {
                 #[serde(skip)]
                 #[serde(default = "::remoc::rtc::empty_client_drop_tx")]
                 drop_tx: ::remoc::rtc::local_broadcast::Sender<()>,
+                #[serde(skip)]
+                #[serde(default = "::remoc::rtc::default_client_monitor")]
+                monitor: ::std::sync::Arc<dyn ::remoc::rtc::ClientMonitor<#req_params>>,
             }
 
             #clone
@@ -1471,6 +1477,7 @@ impl TraitDef {
                         req_tx,
                         max_reply_size: ::remoc::rch::DEFAULT_MAX_ITEM_SIZE,
                         drop_tx: ::remoc::rtc::empty_client_drop_tx(),
+                        monitor: ::remoc::rtc::default_client_monitor(),
                     }
                 }
             }
@@ -1509,6 +1516,16 @@ impl TraitDef {
 
                 fn set_max_reply_size(&mut self, max_reply_size: usize) {
                     self.max_reply_size = max_reply_size
+                }
+            }
+
+            impl #impl_generics_impl ::remoc::rtc::MonitorableClient for #client_ident #impl_generics_ty #impl_generics_where {
+                type Value = #req_value #req_generics;
+                type Ref = #req_ref #req_generics;
+                type RefMut = #req_ref_mut #req_generics;
+
+                fn set_monitor(&mut self, monitor: impl ::remoc::rtc::ClientMonitor<Self::Value, Self::Ref, Self::RefMut> + 'static) {
+                    self.monitor = ::std::sync::Arc::new(monitor);
                 }
             }
 
