@@ -390,14 +390,18 @@ impl From<oneshot::RecvError> for CallError {
 }
 
 /// A request from client to server.
+///
+/// This groups the methods of a remotable trait by how they take `self`.
+/// Each variant holds a per-kind request enum that in turn has one variant per
+/// method of that kind. 
 #[derive(Serialize, Deserialize)]
-pub enum Req<V, R, M> {
-    /// Request by value (`self`).
-    Value(V),
-    /// Request by reference (`&self`).
-    Ref(R),
-    /// Request by mutable reference (`&mut self`).
-    RefMut(M),
+pub enum Req<Value, Ref, RefMut> {
+    /// Request for a method taking self by value (`self`).
+    Value(Value),
+    /// Request for a method taking self by reference (`&self`).
+    Ref(Ref),
+    /// Request for a method taking self by mutable reference (`&mut self`).
+    RefMut(RefMut),
 }
 
 /// Client of a remotable trait.
@@ -548,22 +552,31 @@ where
 }
 
 /// A receiver of requests made by the client of a remotable trait.
-pub trait ReqReceiver<Codec>: ServerBase + Stream<Item = Result<Self::Req, mpsc::RecvError>>
+pub trait ReqReceiver<Codec>:
+    ServerBase + Stream<Item = Result<Req<Self::Value, Self::Ref, Self::RefMut>, mpsc::RecvError>>
 where
     Self: Sized,
 {
-    /// Request enum type.
-    type Req;
+    /// Type of request by value (`self`).
+    type Value;
+    /// Type of request by reference (`&self`).
+    type Ref;
+    /// Type of request by mutable reference (`&mut self`).
+    type RefMut;
 
     /// Creates a new request receiver instance together with its associated client.
     fn new(request_buffer: usize) -> (Self, Self::Client);
 
     /// Receives the next request, i.e. method call, from the client.
     ///
-    /// Handle the request by matching on the variants of the request enum.
-    /// Then reply with the result on the oneshot sender provided in the
-    /// `__reply_tx` field of each enum variant.
-    fn recv(&mut self) -> impl Future<Output = Result<Option<Self::Req>, mpsc::RecvError>> + Send;
+    /// Handle the request by first matching on the [`Req::Value`], [`Req::Ref`]
+    /// and [`Req::RefMut`] variants, which group the methods by how they take
+    /// `self`, and then on the variants of the contained per-kind request enum,
+    /// one per method. Reply with the result on the oneshot sender provided in
+    /// the `__reply_tx` field of each method variant.
+    fn recv(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<Req<Self::Value, Self::Ref, Self::RefMut>>, mpsc::RecvError>> + Send;
 
     /// Closes the receiver half of the request channel without dropping it.
     ///
