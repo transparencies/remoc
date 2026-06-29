@@ -233,6 +233,8 @@
 //! ```
 //!
 
+pub mod monitor;
+
 use futures::future::BoxFuture;
 use std::{
     error::Error,
@@ -410,12 +412,7 @@ pub trait ReqEnum {
 /// Each variant holds a per-kind request enum that in turn has one variant per
 /// method of that kind.
 #[derive(Serialize, Deserialize)]
-pub enum Req<Value, Ref, RefMut>
-where
-    Value: ReqEnum,
-    Ref: ReqEnum,
-    RefMut: ReqEnum,
-{
+pub enum Req<Value, Ref, RefMut> {
     /// Request for a method taking self by value (`self`).
     Value(Value),
     /// Request for a method taking self by reference (`&self`).
@@ -537,7 +534,7 @@ where
     ///
     /// The function can inspect the request and decide whether it should be
     /// sent to the server for processing or dropped.
-    fn pre_call<'a>(&self, req: &'a Req<Value, Ref, RefMut>) -> BoxFuture<'a, CallDecision>;
+    fn pre_call<'a>(&'a self, req: &'a Req<Value, Ref, RefMut>) -> BoxFuture<'a, CallDecision>;
 }
 
 /// Decision on how a request should be processed made by the [client monitor](ClientMonitor).
@@ -728,7 +725,7 @@ where
     /// The function can inspect the request and decide whether it should be
     /// handled, dropped or the server should fail with a custom error.
     fn pre_dispatch<'a>(
-        &mut self, req: &'a Result<Option<Req<Value, Ref, RefMut>>, mpsc::RecvError>,
+        &'a mut self, req: &'a Result<Option<Req<Value, Ref, RefMut>>, mpsc::RecvError>,
     ) -> BoxFuture<'a, DispatchDecision>;
 }
 

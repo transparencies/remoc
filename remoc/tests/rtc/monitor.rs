@@ -11,9 +11,11 @@ use std::{
 };
 
 use futures::{FutureExt, future::BoxFuture};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use remoc::rtc::{
-    DispatchDecision, DispatchGuard, MonitorableServer, Req, ServeError, Server, ServerMonitor, ServerShared,
+    DispatchDecision, DispatchGuard, MonitorableClient, MonitorableServer, Req, ServeError, Server,
+    ServerMonitor, ServerShared,
 };
 
 use crate::loop_channel;
@@ -284,4 +286,219 @@ async fn guard_in_flight() {
     // All requests were in flight simultaneously, proving the guard is moved
     // into the spawned task and kept alive for the request's duration.
     assert_eq!(max.load(Ordering::SeqCst), N);
+}
+
+/// Argument type that always fails to deserialize.
+///
+/// It serializes fine on the client, but its [`Deserialize`] implementation
+/// always fails, so any request carrying it cannot be decoded by the server.
+/// This simulates a client sending malformed or incompatible data.
+#[derive(Clone, Serialize)]
+pub struct FailToDecode(u32);
+
+impl<'de> Deserialize<'de> for FailToDecode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Consume the value from the wire so the framing stays intact, then fail.
+        let _ = u32::deserialize(deserializer)?;
+        Err(serde::de::Error::custom("intentional decode failure"))
+    }
+}
+
+/// Trait with a method whose argument fails to decode and a well-formed method.
+#[remoc::rtc::remote]
+pub trait Decoder {
+    async fn process(&self, value: FailToDecode) -> Result<(), remoc::rtc::CallError>;
+    async fn ping(&self) -> Result<u32, remoc::rtc::CallError>;
+}
+
+pub struct DecoderObj;
+
+impl Decoder for DecoderObj {
+    async fn process(&self, _value: FailToDecode) -> Result<(), remoc::rtc::CallError> {
+        Ok(())
+    }
+
+    async fn ping(&self) -> Result<u32, remoc::rtc::CallError> {
+        Ok(42)
+    }
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn incompatible_client_trips() {
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<DecoderClient>().await;
+
+    println!("Creating decoder server with incompatible-client monitor (limit 3)");
+    let (mut server, client) = DecoderServer::new(DecoderObj, 1);
+    server.set_monitor(remoc::rtc::monitor::IncompatibleClientMonitor::new().limit(Some(3)).log_level(None));
+
+    a_tx.send(client).await.unwrap();
+
+    let client_task = async move {
+        let client = b_rx.recv().await.unwrap().unwrap();
+
+        // Every request fails to decode on the server. The first three failures
+        // are tolerated and the requests dropped; the fourth exceeds the limit
+        // and stops the server. Each call therefore returns an error.
+        for _ in 0..10 {
+            assert!(client.process(FailToDecode(0)).await.is_err());
+        }
+    };
+
+    let (_, (obj, res)) = tokio::join!(client_task, server.serve());
+
+    // The server stopped with the monitor error but still returns the target.
+    assert!(matches!(res, Err(ServeError::Monitor(_))));
+    assert!(obj.is_some());
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn incompatible_client_tolerates() {
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<DecoderClient>().await;
+
+    println!("Creating decoder server with incompatible-client monitor (limiting disabled)");
+    let (mut server, client) = DecoderServer::new(DecoderObj, 1);
+    server.set_monitor(remoc::rtc::monitor::IncompatibleClientMonitor::new().limit(None).log_level(None));
+
+    a_tx.send(client).await.unwrap();
+
+    let client_task = async move {
+        let client = b_rx.recv().await.unwrap().unwrap();
+
+        // These requests fail to decode, but with limiting disabled they are
+        // simply dropped and serving continues.
+        for _ in 0..5 {
+            assert!(client.process(FailToDecode(0)).await.is_err());
+        }
+
+        // A well-formed request is still served normally.
+        assert_eq!(client.ping().await.unwrap(), 42);
+    };
+
+    let (_, (_obj, res)) = tokio::join!(client_task, server.serve());
+    res.unwrap();
+}
+
+/// Server monitor that counts non-final decode failures and drops the offending
+/// requests, so the server keeps serving and the client observes a reply
+/// failure for each of them.
+struct DecodeFailCounter {
+    count: Arc<AtomicUsize>,
+}
+
+impl<V, R, M> ServerMonitor<V, R, M> for DecodeFailCounter
+where
+    V: remoc::rtc::ReqEnum,
+    R: remoc::rtc::ReqEnum,
+    M: remoc::rtc::ReqEnum,
+{
+    fn pre_dispatch<'a>(
+        &mut self, req: &'a Result<Option<Req<V, R, M>>, remoc::rch::mpsc::RecvError>,
+    ) -> BoxFuture<'a, DispatchDecision> {
+        let decision = match req {
+            Err(err) if !err.is_final() => {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                DispatchDecision::Drop
+            }
+            _ => DispatchDecision::Pass,
+        };
+        async move { decision }.boxed()
+    }
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn incompatible_server_throttles() {
+    use remoc::exec::time::{Instant, sleep};
+    use std::time::Duration;
+
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<DecoderClient>().await;
+
+    let server_failures = Arc::new(AtomicUsize::new(0));
+
+    println!("Creating decoder server that tolerates and counts decode failures");
+    let (mut server, client) = DecoderServer::new(DecoderObj, 1);
+    server.set_monitor(DecodeFailCounter { count: server_failures.clone() });
+
+    a_tx.send(client).await.unwrap();
+
+    let window = Duration::from_millis(200);
+
+    let client_task = async move {
+        // The client monitor is set on the received client, since it does not
+        // travel with the client across the connection.
+        let mut client = b_rx.recv().await.unwrap().unwrap();
+        client.set_monitor(
+            remoc::rtc::monitor::IncompatibleServerMonitor::new().limit(Some(1)).window(window).log_level(None),
+        );
+
+        // Every call fails to be received on the server. Once more than one
+        // failure of `process` has occurred within the window, the client
+        // monitor throttles further calls to it by delaying each by one window.
+        let start = Instant::now();
+        for _ in 0..5 {
+            assert!(client.process(FailToDecode(0)).await.is_err(), "decoding should have failed on the server");
+        }
+        start.elapsed()
+    };
+
+    let (elapsed, (_obj, res)) = tokio::join!(client_task, server.serve());
+    res.unwrap();
+
+    // All five calls reached the server: throttling delays calls but never
+    // drops them.
+    assert_eq!(server_failures.load(Ordering::SeqCst), 5);
+
+    // The first two calls passed immediately; the remaining three were each
+    // delayed by one window, so the loop took noticeably longer than a single
+    // window.
+    assert!(
+        elapsed >= window * 2,
+        "calls to the failing method should have been throttled, but only took {elapsed:?}"
+    );
+
+    // A short follow-up sleep lets the connection drain cleanly before shutdown.
+    sleep(Duration::from_millis(10)).await;
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn incompatible_server_tolerates() {
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<DecoderClient>().await;
+
+    let server_failures = Arc::new(AtomicUsize::new(0));
+
+    println!("Creating decoder server with incompatible-server monitor (limiting disabled)");
+    let (mut server, client) = DecoderServer::new(DecoderObj, 1);
+    server.set_monitor(DecodeFailCounter { count: server_failures.clone() });
+
+    a_tx.send(client).await.unwrap();
+
+    let client_task = async move {
+        let mut client = b_rx.recv().await.unwrap().unwrap();
+        client.set_monitor(remoc::rtc::monitor::IncompatibleServerMonitor::new().limit(None).log_level(None));
+
+        // With limiting disabled, the client never throttles calls, so all of
+        // them reach the server even though they all fail to decode there.
+        for _ in 0..10 {
+            assert!(client.process(FailToDecode(0)).await.is_err());
+        }
+
+        // A well-formed call is still served normally.
+        assert_eq!(client.ping().await.unwrap(), 42);
+    };
+
+    let (_, (_obj, res)) = tokio::join!(client_task, server.serve());
+    res.unwrap();
+
+    // All ten failing calls reached the server, none were throttled.
+    assert_eq!(server_failures.load(Ordering::SeqCst), 10);
 }
