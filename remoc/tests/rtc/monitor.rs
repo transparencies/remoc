@@ -546,3 +546,48 @@ async fn rate_limit_monitor_throttles() {
     assert!(elapsed >= window * 2, "calls should have been rate limited, but only took {elapsed:?}");
 }
 
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn concurrent_limit_monitor_limits() {
+    use remoc::exec::time::Instant;
+    use std::{num::NonZeroUsize, time::Duration};
+
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<WorkerClient>().await;
+
+    const N: usize = 5;
+
+    println!("Creating shared worker server with the concurrent-limit monitor (limit 2)");
+    let (mut server, client) = WorkerServerShared::new(Arc::new(WorkerObj), 16);
+    server.set_monitor(
+        remoc::rtc::monitor::ConcurrentLimitMonitor::new(NonZeroUsize::new(2).unwrap()).log_level(None),
+    );
+
+    a_tx.send(client).await.unwrap();
+
+    let client_task = async move {
+        let client = b_rx.recv().await.unwrap().unwrap();
+
+        // Each call keeps the worker busy for 100 ms. With at most two requests
+        // processed concurrently, five overlapping calls form three sequential
+        // batches (2 + 2 + 1), so the run takes roughly three work durations.
+        let start = Instant::now();
+        let calls: Vec<_> = (0..N).map(|_| client.work()).collect();
+        for res in futures::future::join_all(calls).await {
+            res.unwrap();
+        }
+        start.elapsed()
+    };
+
+    // Serve with spawning so that requests can be handled concurrently.
+    let (elapsed, res) = tokio::join!(client_task, server.serve(true));
+    res.unwrap();
+
+    // The concurrency cap forces the five overlapping calls into three batches,
+    // taking clearly longer than the single 100 ms work duration that an
+    // unbounded server would need.
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "calls should have been limited to two at a time, but only took {elapsed:?}"
+    );
+}

@@ -14,10 +14,12 @@ macro_rules! log_at {
     };
 }
 
+mod concurrent;
 mod incompatible_client;
 mod incompatible_server;
 mod rate_limit;
 
+pub use concurrent::ConcurrentLimitMonitor;
 pub use incompatible_client::{IncompatibleClientLimitExceeded, IncompatibleClientMonitor};
 pub use incompatible_server::IncompatibleServerMonitor;
 pub use rate_limit::RateLimitMonitor;
