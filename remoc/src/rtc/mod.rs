@@ -580,6 +580,81 @@ pub trait CallGuard: Send {
     }
 }
 
+/// Combines two [client](ClientMonitor) or [server](ServerMonitor) monitors into one.
+///
+/// Construct it directly from the two monitors to combine, for example
+/// `ChainedMonitor(first, second)`, and install the result on a client or server.
+/// To combine more than two monitors, nest the construction, e.g.
+/// `ChainedMonitor(a, ChainedMonitor(b, c))`.
+///
+/// For each request the two monitors are evaluated in order: first `self.0`, then
+/// `self.1`. The combined decision is formed as follows:
+///
+///  * If a monitor drops the request ([`CallDecision::Drop`] / [`DispatchDecision::Drop`]),
+///    the request is dropped and the remaining monitor is not evaluated.
+///  * For a server monitor, if a monitor returns [`DispatchDecision::Error`], serving
+///    stops with that error and the remaining monitor is not evaluated.
+///  * Otherwise the request passes. Any guard produced by either monitor is held for
+///    the duration of the request and released once it finishes. Guards are released
+///    in reverse order, i.e. `self.1`'s guard is dropped before `self.0`'s, and guard
+///    notifications ([`failed`](CallGuard::failed), [`reply_failed`](CallGuard::reply_failed)
+///    and [`failed`](DispatchGuard::failed)) are forwarded to both.
+///
+/// Because evaluation is sequential and short-circuits, the order matters for monitors
+/// that account for a request only while their returned future is awaited (such as the
+/// [rate](monitor::RateLimitMonitor) and [concurrent](monitor::ConcurrentLimitMonitor)
+/// limiters): a request dropped or rejected by `self.0` is never seen by `self.1`.
+pub struct ChainedMonitor<A, B>(pub A, pub B);
+
+impl<A, B, Value, Ref, RefMut> ClientMonitor<Value, Ref, RefMut> for ChainedMonitor<A, B>
+where
+    A: ClientMonitor<Value, Ref, RefMut>,
+    B: ClientMonitor<Value, Ref, RefMut>,
+    Value: ReqEnum,
+    Ref: ReqEnum,
+    RefMut: ReqEnum,
+{
+    fn pre_call<'a>(&'a self, req: &'a Req<Value, Ref, RefMut>) -> BoxFuture<'a, CallDecision> {
+        let pre_call_0 = self.0.pre_call(req);
+        let pre_call_1 = self.1.pre_call(req);
+
+        async move {
+            let guard_0 = match pre_call_0.await {
+                CallDecision::Pass => None,
+                CallDecision::Guard(guard) => Some(guard),
+                CallDecision::Drop => return CallDecision::Drop,
+            };
+
+            let guard_1 = match pre_call_1.await {
+                CallDecision::Pass => None,
+                CallDecision::Guard(guard) => Some(guard),
+                CallDecision::Drop => return CallDecision::Drop,
+            };
+
+            match (guard_0, guard_1) {
+                (None, None) => CallDecision::Pass,
+                (Some(guard0), None) => CallDecision::Guard(guard0),
+                (None, Some(guard1)) => CallDecision::Guard(guard1),
+                (Some(guard0), Some(guard1)) => CallDecision::Guard(Box::new(ChainedCallGuard(guard1, guard0))),
+            }
+        }
+        .boxed()
+    }
+}
+
+struct ChainedCallGuard(Box<dyn CallGuard>, Box<dyn CallGuard>);
+impl CallGuard for ChainedCallGuard {
+    fn failed(&mut self) {
+        self.0.failed();
+        self.1.failed();
+    }
+
+    fn reply_failed(&mut self, err: &oneshot::RecvError) {
+        self.0.reply_failed(err);
+        self.1.reply_failed(err);
+    }
+}
+
 /// Base trait shared between all server variants of a remotable trait.
 pub trait ServerBase {
     /// The client type, which can be sent to a remote endpoint.
@@ -700,7 +775,7 @@ where
     fn close(&mut self);
 }
 
-/// Allows setting the [server monitor](ServerMonitor) on a server.
+/// Allows setting the [server monitor](ServerMonitor) on a [server](ServerBase).
 pub trait MonitorableServer {
     /// Type of request by value (`self`).
     type Value: ReqEnum;
@@ -727,6 +802,56 @@ where
     fn pre_dispatch<'a>(
         &'a mut self, req: &'a Result<Option<Req<Value, Ref, RefMut>>, mpsc::RecvError>,
     ) -> BoxFuture<'a, DispatchDecision>;
+}
+
+impl<A, B, Value, Ref, RefMut> ServerMonitor<Value, Ref, RefMut> for ChainedMonitor<A, B>
+where
+    A: ServerMonitor<Value, Ref, RefMut>,
+    B: ServerMonitor<Value, Ref, RefMut>,
+    Value: ReqEnum,
+    Ref: ReqEnum,
+    RefMut: ReqEnum,
+{
+    fn pre_dispatch<'a>(
+        &'a mut self, req: &'a Result<Option<Req<Value, Ref, RefMut>>, mpsc::RecvError>,
+    ) -> BoxFuture<'a, DispatchDecision> {
+        let pre_dispatch_0 = self.0.pre_dispatch(req);
+        let pre_dispatch_1 = self.1.pre_dispatch(req);
+
+        async move {
+            let guard_0 = match pre_dispatch_0.await {
+                DispatchDecision::Pass => None,
+                DispatchDecision::Guard(guard) => Some(guard),
+                DispatchDecision::Drop => return DispatchDecision::Drop,
+                DispatchDecision::Error(err) => return DispatchDecision::Error(err),
+            };
+
+            let guard_1 = match pre_dispatch_1.await {
+                DispatchDecision::Pass => None,
+                DispatchDecision::Guard(guard) => Some(guard),
+                DispatchDecision::Drop => return DispatchDecision::Drop,
+                DispatchDecision::Error(err) => return DispatchDecision::Error(err),
+            };
+
+            match (guard_0, guard_1) {
+                (None, None) => DispatchDecision::Pass,
+                (Some(guard0), None) => DispatchDecision::Guard(guard0),
+                (None, Some(guard1)) => DispatchDecision::Guard(guard1),
+                (Some(guard0), Some(guard1)) => {
+                    DispatchDecision::Guard(Box::new(ChainedDispatchGuard(guard1, guard0)))
+                }
+            }
+        }
+        .boxed()
+    }
+}
+
+struct ChainedDispatchGuard(Box<dyn DispatchGuard>, Box<dyn DispatchGuard>);
+impl DispatchGuard for ChainedDispatchGuard {
+    fn failed(&mut self) {
+        self.0.failed();
+        self.1.failed();
+    }
 }
 
 /// Request dispatch guard.

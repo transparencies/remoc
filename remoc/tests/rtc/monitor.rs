@@ -14,8 +14,8 @@ use futures::{FutureExt, future::BoxFuture};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use remoc::rtc::{
-    DispatchDecision, DispatchGuard, MonitorableClient, MonitorableServer, Req, ServeError, Server,
-    ServerMonitor, ServerShared,
+    CallDecision, ChainedMonitor, ClientMonitor, DispatchDecision, DispatchGuard, MonitorableClient,
+    MonitorableServer, Req, ServeError, Server, ServerMonitor, ServerShared,
 };
 
 use crate::loop_channel;
@@ -590,4 +590,244 @@ async fn concurrent_limit_monitor_limits() {
         elapsed >= Duration::from_millis(250),
         "calls should have been limited to two at a time, but only took {elapsed:?}"
     );
+}
+
+/// Server monitor that drops every request.
+///
+/// The accounting happens inside the returned future, so a request short-circuited
+/// by a preceding monitor in a chain is never observed.
+struct DropMonitor;
+
+impl<V, R, M> ServerMonitor<V, R, M> for DropMonitor
+where
+    V: remoc::rtc::ReqEnum,
+    R: remoc::rtc::ReqEnum,
+    M: remoc::rtc::ReqEnum,
+{
+    fn pre_dispatch<'a>(
+        &mut self, req: &'a Result<Option<Req<V, R, M>>, remoc::rch::mpsc::RecvError>,
+    ) -> BoxFuture<'a, DispatchDecision> {
+        let is_req = matches!(req, Ok(Some(_)));
+        async move { if is_req { DispatchDecision::Drop } else { DispatchDecision::Pass } }.boxed()
+    }
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn chain_server_monitors_both_apply() {
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<CounterClient>().await;
+
+    let count_a = Arc::new(AtomicUsize::new(0));
+    let count_b = Arc::new(AtomicUsize::new(0));
+
+    println!("Creating counter server with two chained counting monitors");
+    let (mut server, client) = CounterServer::new(CounterObj { value: 0 }, 1);
+    server.set_monitor(ChainedMonitor(
+        CountingMonitor { count: count_a.clone() },
+        CountingMonitor { count: count_b.clone() },
+    ));
+
+    a_tx.send(client).await.unwrap();
+
+    let client_task = async move {
+        let mut client = b_rx.recv().await.unwrap().unwrap();
+
+        client.increase(20).await.unwrap();
+        assert_eq!(client.value_ref().await.unwrap(), 20);
+        client.increase(45).await.unwrap();
+        assert_eq!(client.value().await.unwrap(), 65);
+    };
+
+    let (_, (obj, res)) = tokio::join!(client_task, server.serve());
+    res.unwrap();
+    assert!(obj.is_none());
+
+    // Both monitors in the chain observed every one of the four requests.
+    assert_eq!(count_a.load(Ordering::SeqCst), 4);
+    assert_eq!(count_b.load(Ordering::SeqCst), 4);
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn chain_server_monitors_short_circuit() {
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<CounterClient>().await;
+
+    let count = Arc::new(AtomicUsize::new(0));
+
+    println!("Creating counter server with a dropping monitor chained before a counting monitor");
+    let (mut server, client) = CounterServer::new(CounterObj { value: 0 }, 1);
+    server.set_monitor(ChainedMonitor(DropMonitor, CountingMonitor { count: count.clone() }));
+
+    a_tx.send(client).await.unwrap();
+
+    let client_task = async move {
+        let mut client = b_rx.recv().await.unwrap().unwrap();
+
+        // The first monitor drops every request, so each call fails and the
+        // second monitor never sees them.
+        assert!(client.increase(20).await.is_err());
+        assert!(client.value_ref().await.is_err());
+    };
+
+    let (_, (obj, res)) = tokio::join!(client_task, server.serve());
+
+    // Dropping requests does not fail the server, and the target was never consumed.
+    res.unwrap();
+    assert!(obj.is_some());
+
+    // The second monitor was short-circuited by the first, so it counted nothing.
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn chain_server_monitors_guards() {
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<WorkerClient>().await;
+
+    const N: usize = 5;
+
+    let in_flight_a = Arc::new(AtomicUsize::new(0));
+    let max_a = Arc::new(AtomicUsize::new(0));
+    let in_flight_b = Arc::new(AtomicUsize::new(0));
+    let max_b = Arc::new(AtomicUsize::new(0));
+
+    println!("Creating shared worker server with two chained in-flight guard monitors");
+    let (mut server, client) = WorkerServerShared::new(Arc::new(WorkerObj), 16);
+    server.set_monitor(ChainedMonitor(
+        InFlightMonitor { in_flight: in_flight_a.clone(), max: max_a.clone() },
+        InFlightMonitor { in_flight: in_flight_b.clone(), max: max_b.clone() },
+    ));
+
+    a_tx.send(client).await.unwrap();
+
+    let client_task = async move {
+        let client = b_rx.recv().await.unwrap().unwrap();
+
+        let calls: Vec<_> = (0..N).map(|_| client.work()).collect();
+        for res in futures::future::join_all(calls).await {
+            res.unwrap();
+        }
+    };
+
+    let (_, res) = tokio::join!(client_task, server.serve(true));
+    res.unwrap();
+
+    // Both guards were attached to every request and dropped once it finished,
+    // so each monitor saw all requests in flight simultaneously and ended at zero.
+    assert_eq!(in_flight_a.load(Ordering::SeqCst), 0);
+    assert_eq!(max_a.load(Ordering::SeqCst), N);
+    assert_eq!(in_flight_b.load(Ordering::SeqCst), 0);
+    assert_eq!(max_b.load(Ordering::SeqCst), N);
+}
+
+/// Client monitor that counts the requests it sees.
+///
+/// The accounting happens inside the returned future, so a request short-circuited
+/// by a preceding monitor in a chain is never observed.
+struct CountingClientMonitor {
+    count: Arc<AtomicUsize>,
+}
+
+impl<V, R, M> ClientMonitor<V, R, M> for CountingClientMonitor
+where
+    V: remoc::rtc::ReqEnum,
+    R: remoc::rtc::ReqEnum,
+    M: remoc::rtc::ReqEnum,
+{
+    fn pre_call<'a>(&'a self, _req: &'a Req<V, R, M>) -> BoxFuture<'a, CallDecision> {
+        let count = self.count.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            CallDecision::Pass
+        }
+        .boxed()
+    }
+}
+
+/// Client monitor that drops every request before it is sent to the server.
+struct DropClientMonitor;
+
+impl<V, R, M> ClientMonitor<V, R, M> for DropClientMonitor
+where
+    V: remoc::rtc::ReqEnum,
+    R: remoc::rtc::ReqEnum,
+    M: remoc::rtc::ReqEnum,
+{
+    fn pre_call<'a>(&'a self, _req: &'a Req<V, R, M>) -> BoxFuture<'a, CallDecision> {
+        async move { CallDecision::Drop }.boxed()
+    }
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn chain_client_monitors_both_apply() {
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<CounterClient>().await;
+
+    let count_a = Arc::new(AtomicUsize::new(0));
+    let count_b = Arc::new(AtomicUsize::new(0));
+
+    println!("Creating counter server; the received client gets two chained counting monitors");
+    let (server, client) = CounterServer::new(CounterObj { value: 0 }, 1);
+
+    a_tx.send(client).await.unwrap();
+
+    let count_a_mon = count_a.clone();
+    let count_b_mon = count_b.clone();
+    let client_task = async move {
+        let mut client = b_rx.recv().await.unwrap().unwrap();
+        client.set_monitor(ChainedMonitor(
+            CountingClientMonitor { count: count_a_mon },
+            CountingClientMonitor { count: count_b_mon },
+        ));
+
+        client.increase(20).await.unwrap();
+        assert_eq!(client.value_ref().await.unwrap(), 20);
+        client.increase(45).await.unwrap();
+        assert_eq!(client.value().await.unwrap(), 65);
+    };
+
+    let (_, (_obj, res)) = tokio::join!(client_task, server.serve());
+    res.unwrap();
+
+    // Both monitors in the chain observed every one of the four requests.
+    assert_eq!(count_a.load(Ordering::SeqCst), 4);
+    assert_eq!(count_b.load(Ordering::SeqCst), 4);
+}
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn chain_client_monitors_short_circuit() {
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<CounterClient>().await;
+
+    let count = Arc::new(AtomicUsize::new(0));
+
+    println!("Creating counter server; the received client drops requests before a counting monitor");
+    let (server, client) = CounterServer::new(CounterObj { value: 0 }, 1);
+
+    a_tx.send(client).await.unwrap();
+
+    let count_mon = count.clone();
+    let client_task = async move {
+        let mut client = b_rx.recv().await.unwrap().unwrap();
+        client.set_monitor(ChainedMonitor(DropClientMonitor, CountingClientMonitor { count: count_mon }));
+
+        // The first monitor drops every request before it is sent, so each call
+        // fails and the second monitor never sees them.
+        assert!(client.increase(20).await.is_err());
+        assert!(client.value_ref().await.is_err());
+    };
+
+    let (_, (obj, res)) = tokio::join!(client_task, server.serve());
+    res.unwrap();
+
+    // No request ever reached the server, so the target was never consumed.
+    assert!(obj.is_some());
+
+    // The second monitor was short-circuited by the first, so it counted nothing.
+    assert_eq!(count.load(Ordering::SeqCst), 0);
 }
