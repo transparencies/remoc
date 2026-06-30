@@ -902,7 +902,14 @@ macro_rules! server_monitor_pre_dispatch {
         match $monitor.pre_dispatch(&$req).await {
             ::remoc::rtc::DispatchDecision::Pass => ::std::boxed::Box::new(::remoc::rtc::DefaultGuard),
             ::remoc::rtc::DispatchDecision::Guard(guard) => guard,
-            ::remoc::rtc::DispatchDecision::Drop => continue,
+            ::remoc::rtc::DispatchDecision::Drop => {
+                match &$req {
+                    Ok(None) => (),
+                    Err(err) if err.is_final() => (),
+                    _ => continue,
+                }
+                ::std::boxed::Box::new(::remoc::rtc::DefaultGuard)
+            }
             ::remoc::rtc::DispatchDecision::Error(err) => return Err(::remoc::rtc::ServeError::Monitor(err)),
         }
     };
@@ -910,7 +917,14 @@ macro_rules! server_monitor_pre_dispatch {
         match $monitor.pre_dispatch(&$req).await {
             ::remoc::rtc::DispatchDecision::Pass => ::std::boxed::Box::new(::remoc::rtc::DefaultGuard),
             ::remoc::rtc::DispatchDecision::Guard(guard) => guard,
-            ::remoc::rtc::DispatchDecision::Drop => continue,
+            ::remoc::rtc::DispatchDecision::Drop => {
+                match &$req {
+                    Ok(None) => (),
+                    Err(err) if err.is_final() => (),
+                    _ => continue,
+                }
+                ::std::boxed::Box::new(::remoc::rtc::DefaultGuard)
+            }
             ::remoc::rtc::DispatchDecision::Error(err) => {
                 return (Some($target), Err(::remoc::rtc::ServeError::Monitor(err)))
             }
