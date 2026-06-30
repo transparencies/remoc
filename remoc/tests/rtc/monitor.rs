@@ -502,3 +502,47 @@ async fn incompatible_server_tolerates() {
     // All ten failing calls reached the server, none were throttled.
     assert_eq!(server_failures.load(Ordering::SeqCst), 10);
 }
+
+#[cfg_attr(not(feature = "js"), tokio::test)]
+#[cfg_attr(feature = "js", wasm_bindgen_test)]
+async fn rate_limit_monitor_throttles() {
+    use remoc::exec::time::Instant;
+    use std::{num::NonZeroUsize, time::Duration};
+
+    crate::init();
+    let ((mut a_tx, _), (_, mut b_rx)) = loop_channel::<CounterClient>().await;
+
+    let window = Duration::from_millis(200);
+
+    println!("Creating counter server with the rate-limit monitor (2 requests per window)");
+    let (mut server, client) = CounterServer::new(CounterObj { value: 0 }, 1);
+    server.set_monitor(
+        remoc::rtc::monitor::RateLimitMonitor::new(NonZeroUsize::new(2).unwrap(), window).log_level(None),
+    );
+
+    a_tx.send(client).await.unwrap();
+
+    let client_task = async move {
+        let client = b_rx.recv().await.unwrap().unwrap();
+
+        // Six requests with a budget of two per window. The first two pass
+        // immediately; the rate limiter then delays the rest, releasing two per
+        // window. This requires waiting out two full windows in total.
+        let start = Instant::now();
+        for _ in 0..6 {
+            assert_eq!(client.value_ref().await.unwrap(), 0);
+        }
+        start.elapsed()
+    };
+
+    let (elapsed, (obj, res)) = tokio::join!(client_task, server.serve());
+    res.unwrap();
+
+    // Only `&self` methods were called, so the target was never consumed.
+    assert!(obj.is_some());
+
+    // Rate limiting delays calls but never drops or fails them, so all six
+    // succeeded while taking at least two window durations.
+    assert!(elapsed >= window * 2, "calls should have been rate limited, but only took {elapsed:?}");
+}
+
